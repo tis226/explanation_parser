@@ -52,6 +52,7 @@ class Chunk:
     page_number: int = 0
     source_pdf: str = ""
     bbox: Optional[List[float]] = None
+    _normalized_cache: Optional[str] = field(default=None, init=False, repr=False)
 
     def append_line(self, line: dict) -> None:
         text = line.get("text", "")
@@ -78,6 +79,12 @@ class Chunk:
         if self.question_number is not None:
             return f"{base}#{self.question_number}"
         return base
+
+    @property
+    def normalized_text(self) -> str:
+        if self._normalized_cache is None:
+            self._normalized_cache = normalize_text(self.text)
+        return self._normalized_cache
 
 
 QUESTION_HEADING_PATTERNS = [
@@ -149,44 +156,40 @@ def order_page_lines(lines: Sequence[dict], page_width: float) -> List[dict]:
     return ordered
 
 
-def extract_chunks_from_page(page, source_pdf: str) -> Iterator[Chunk]:
-    lines = page.extract_text_lines() or []
-    ordered_lines = order_page_lines(lines, page.width)
-
-    current_chunk: Optional[Chunk] = None
-
-    for line in ordered_lines:
-        text = (line.get("text") or "").strip()
-        if not text:
-            continue
-
-        heading_number = parse_question_heading(text)
-
-        if heading_number is not None:
-            if current_chunk is not None and current_chunk.text_lines:
-                yield current_chunk
-            current_chunk = Chunk(
-                question_number=heading_number,
-                page_number=int(page.page_number) + 1,
-                source_pdf=source_pdf,
-            )
-            current_chunk.append_line(line)
-        else:
-            if current_chunk is None:
-                # Ignore text before the first heading on a page
-                continue
-            current_chunk.append_line(line)
-
-    if current_chunk is not None and current_chunk.text_lines:
-        yield current_chunk
-
-
 def extract_pdf_chunks(pdf_path: Path) -> List[Chunk]:
     chunks: List[Chunk] = []
+    current_chunk: Optional[Chunk] = None
+
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            for chunk in extract_chunks_from_page(page, str(pdf_path)):
-                chunks.append(chunk)
+            lines = page.extract_text_lines() or []
+            ordered_lines = order_page_lines(lines, page.width)
+
+            for line in ordered_lines:
+                text = (line.get("text") or "").strip()
+                if not text:
+                    continue
+
+                heading_number = parse_question_heading(text)
+
+                if heading_number is not None:
+                    if current_chunk is not None and current_chunk.text_lines:
+                        chunks.append(current_chunk)
+                    current_chunk = Chunk(
+                        question_number=heading_number,
+                        page_number=int(page.page_number) + 1,
+                        source_pdf=str(pdf_path),
+                    )
+                    current_chunk.append_line(line)
+                else:
+                    if current_chunk is None:
+                        # Ignore text before the first heading encountered in the PDF.
+                        continue
+                    current_chunk.append_line(line)
+
+        if current_chunk is not None and current_chunk.text_lines:
+            chunks.append(current_chunk)
+
     LOGGER.info("Extracted %d chunks from %s", len(chunks), pdf_path)
     return chunks
 
@@ -227,7 +230,17 @@ def match_chunks(
     all_records = [record for records in index_by_number.values() for record in records]
 
     for chunk in chunks:
-        normalized_chunk_text = normalize_text(chunk.text)
+        normalized_chunk_text = chunk.normalized_text
+        if not normalized_chunk_text:
+            continue
+
+        if not any(option in chunk.text for option in ("①", "②", "③", "④", "⑤")):
+            LOGGER.debug(
+                "Skipping chunk for question %s on page %s because it lacks option markers.",
+                chunk.question_number,
+                chunk.page_number,
+            )
+            continue
         question_number_key = (
             str(chunk.question_number)
             if chunk.question_number is not None
@@ -239,7 +252,12 @@ def match_chunks(
 
         # First try question-number-specific matches
         for candidate in candidates:
-            score = similarity(normalized_chunk_text, candidate.normalized_text)
+            score = 0.0
+            if candidate.normalized_text and candidate.normalized_text in normalized_chunk_text:
+                score = 1.0
+            else:
+                truncated = normalized_chunk_text[: max(len(candidate.normalized_text) * 2, 120)]
+                score = similarity(candidate.normalized_text, truncated)
             if score > best_score:
                 best_score = score
                 best_record = candidate
@@ -247,7 +265,12 @@ def match_chunks(
         # Fallback to global search if necessary
         if best_record is None or best_score < min_ratio:
             for candidate in all_records:
-                score = similarity(normalized_chunk_text, candidate.normalized_text)
+                score = 0.0
+                if candidate.normalized_text and candidate.normalized_text in normalized_chunk_text:
+                    score = 1.0
+                else:
+                    truncated = normalized_chunk_text[: max(len(candidate.normalized_text) * 2, 120)]
+                    score = similarity(candidate.normalized_text, truncated)
                 if score > best_score:
                     best_score = score
                     best_record = candidate
@@ -336,6 +359,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         all_chunks.extend(extract_pdf_chunks(pdf_path))
 
     matches = match_chunks(all_chunks, index_by_number, min_ratio=args.min_score)
+    matched_questions = sum(1 for explanations in matches.values() if explanations)
+    total_explanations = sum(len(explanations) for explanations in matches.values())
+    LOGGER.info(
+        "Matched explanations for %d/%d questions (total explanations: %d)",
+        matched_questions,
+        len(records),
+        total_explanations,
+    )
     augmented_records = attach_explanations(records, matches)
 
     output_json = json.dumps(augmented_records, ensure_ascii=False, indent=2)

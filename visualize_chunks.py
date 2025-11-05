@@ -186,8 +186,17 @@ def compute_bounding_boxes(
     if not relevant_lines:
         return []
 
+    trimmed_lines: List[LineInfo] = []
+    for idx, line in enumerate(relevant_lines):
+        if idx > 0 and parse_question_heading(line.text) is not None:
+            break
+        trimmed_lines.append(line)
+
+    if not trimmed_lines:
+        return []
+
     lines_by_page: Dict[int, List[LineInfo]] = defaultdict(list)
-    for line in relevant_lines:
+    for line in trimmed_lines:
         lines_by_page[line.page_number].append(line)
 
     visual_chunks: List[VisualChunk] = []
@@ -302,9 +311,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     visual_chunks: List[VisualChunk] = []
 
+    skip_keywords = ["박우찬"]
+
     for pdf_path in args.pdf:
         if not pdf_path.exists():
             LOGGER.error("PDF not found: %s", pdf_path)
+            continue
+
+        if any(keyword in pdf_path.name for keyword in skip_keywords):
+            LOGGER.info(
+                "Skipping PDF %s because it uses a two-column layout not yet supported.",
+                pdf_path,
+            )
             continue
 
         for chunk_lines in iter_pdf_chunks(pdf_path):

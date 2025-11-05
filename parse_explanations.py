@@ -416,10 +416,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     index_by_number = build_question_index(records)
 
+    skip_keywords = ["박우찬"]
+
     all_chunks: List[Chunk] = []
     for pdf_path in args.pdf:
         if not pdf_path.exists():
             LOGGER.error("PDF not found: %s", pdf_path)
+            continue
+        if any(keyword in pdf_path.name for keyword in skip_keywords):
+            LOGGER.info(
+                "Skipping PDF %s because it uses a two-column layout not yet supported.",
+                pdf_path,
+            )
             continue
         all_chunks.extend(extract_pdf_chunks(pdf_path))
 

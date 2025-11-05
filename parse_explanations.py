@@ -14,6 +14,11 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
 import pdfplumber
 
+try:
+    from PIL import Image  # noqa: F401  # Imported for side effects when pdfplumber renders images
+except Exception:  # pragma: no cover - pillow is an optional dependency shipped with pdfplumber
+    Image = None
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -312,6 +317,60 @@ def attach_explanations(records: List[dict], matches: Dict[int, List[dict]]) -> 
     return result
 
 
+def render_chunk_previews(chunks: Sequence[Chunk], output_dir: Path, resolution: int = 144) -> None:
+    """Render PNG previews with chunk bounding boxes overlaid on each PDF page."""
+
+    if Image is None:
+        LOGGER.warning(
+            "Cannot render previews because Pillow is unavailable. Install pillow to enable previews."
+        )
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chunks_by_pdf: Dict[Path, Dict[int, List[Chunk]]] = defaultdict(lambda: defaultdict(list))
+
+    for chunk in chunks:
+        if not chunk.bbox:
+            continue
+        pdf_path = Path(chunk.source_pdf)
+        chunks_by_pdf[pdf_path][chunk.page_number].append(chunk)
+
+    for pdf_path, pages in chunks_by_pdf.items():
+        if not pdf_path.exists():
+            LOGGER.warning("Skipping preview rendering for missing PDF: %s", pdf_path)
+            continue
+
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_number, page_chunks in pages.items():
+                page_index = page_number - 1
+                if page_index < 0 or page_index >= len(pdf.pages):
+                    LOGGER.debug(
+                        "Chunk page number %s out of bounds for %s (total pages %s)",
+                        page_number,
+                        pdf_path,
+                        len(pdf.pages),
+                    )
+                    continue
+
+                page = pdf.pages[page_index]
+                page_image = page.to_image(resolution=resolution)
+
+                for chunk in page_chunks:
+                    if not chunk.bbox:
+                        continue
+                    x0, top, x1, bottom = chunk.bbox
+                    page_image.draw_rect(
+                        (x0, top, x1, bottom), stroke="red", stroke_width=2
+                    )
+                    label = f"Q{chunk.question_number or '?'}"
+                    label_position = (x0, max(top - 12, 0))
+                    page_image.draw.text(label_position, label, fill="red")
+
+                preview_path = output_dir / f"{pdf_path.stem}_page_{page_number:03d}.png"
+                page_image.save(str(preview_path))
+                LOGGER.debug("Saved preview %s", preview_path)
+
+
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Parse explanation PDFs and merge into JSON data.")
     parser.add_argument("--json", required=True, type=Path, help="Path to the source JSON file.")
@@ -327,6 +386,12 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to write the augmented JSON file. If omitted, prints to stdout.",
+    )
+    parser.add_argument(
+        "--preview-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to write PNG previews with chunk bounding boxes.",
     )
     parser.add_argument(
         "--min-score",
@@ -357,6 +422,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             LOGGER.error("PDF not found: %s", pdf_path)
             continue
         all_chunks.extend(extract_pdf_chunks(pdf_path))
+
+    if args.preview_dir:
+        render_chunk_previews(all_chunks, args.preview_dir)
 
     matches = match_chunks(all_chunks, index_by_number, min_ratio=args.min_score)
     matched_questions = sum(1 for explanations in matches.values() if explanations)

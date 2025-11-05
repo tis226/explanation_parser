@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import pdfplumber
 
@@ -51,29 +51,41 @@ class QuestionRecord:
 
 
 @dataclass
+class ChunkLine:
+    page_number: int
+    text: str
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+
+
+@dataclass
 class Chunk:
     question_number: Optional[int]
-    text_lines: List[str] = field(default_factory=list)
     page_number: int = 0
     source_pdf: str = ""
-    bbox: Optional[List[float]] = None
+    lines: List[ChunkLine] = field(default_factory=list)
     _normalized_cache: Optional[str] = field(default=None, init=False, repr=False)
 
-    def append_line(self, line: dict) -> None:
-        text = line.get("text", "")
-        if text:
-            self.text_lines.append(text)
-        x0 = float(line.get("x0", 0))
-        x1 = float(line.get("x1", 0))
-        top = float(line.get("top", 0))
-        bottom = float(line.get("bottom", 0))
-        if self.bbox is None:
-            self.bbox = [x0, top, x1, bottom]
-        else:
-            self.bbox[0] = min(self.bbox[0], x0)
-            self.bbox[1] = min(self.bbox[1], top)
-            self.bbox[2] = max(self.bbox[2], x1)
-            self.bbox[3] = max(self.bbox[3], bottom)
+    def append_line(self, line: dict, page_number: int) -> None:
+        text = (line.get("text") or "").strip()
+        if not text:
+            return
+        self.lines.append(
+            ChunkLine(
+                page_number=page_number,
+                text=text,
+                x0=float(line.get("x0", 0.0)),
+                top=float(line.get("top", 0.0)),
+                x1=float(line.get("x1", 0.0)),
+                bottom=float(line.get("bottom", 0.0)),
+            )
+        )
+
+    @property
+    def text_lines(self) -> List[str]:
+        return [line.text for line in self.lines]
 
     @property
     def text(self) -> str:
@@ -90,6 +102,39 @@ class Chunk:
         if self._normalized_cache is None:
             self._normalized_cache = normalize_text(self.text)
         return self._normalized_cache
+
+    @property
+    def bbox(self) -> Optional[List[float]]:
+        """Return the bounding box for the first page of the chunk."""
+
+        spans = list(self.iter_page_bboxes())
+        if not spans:
+            return None
+        first_page, bbox = spans[0]
+        return list(bbox)
+
+    def iter_page_bboxes(self) -> Iterator[tuple[int, Sequence[float]]]:
+        """Yield (page_number, bbox) pairs for each page covered by the chunk."""
+
+        bboxes: Dict[int, List[float]] = {}
+        for line in self.lines:
+            bbox = bboxes.setdefault(
+                line.page_number,
+                [line.x0, line.top, line.x1, line.bottom],
+            )
+            bbox[0] = min(bbox[0], line.x0)
+            bbox[1] = min(bbox[1], line.top)
+            bbox[2] = max(bbox[2], line.x1)
+            bbox[3] = max(bbox[3], line.bottom)
+        for page_number in sorted(bboxes):
+            yield page_number, bboxes[page_number]
+
+    @property
+    def page_spans(self) -> List[dict]:
+        return [
+            {"page": page_number, "bbox": list(bbox)}
+            for page_number, bbox in self.iter_page_bboxes()
+        ]
 
 
 QUESTION_HEADING_PATTERNS = [
@@ -185,12 +230,12 @@ def extract_pdf_chunks(pdf_path: Path) -> List[Chunk]:
                         page_number=int(page.page_number),
                         source_pdf=str(pdf_path),
                     )
-                    current_chunk.append_line(line)
+                    current_chunk.append_line(line, int(page.page_number))
                 else:
                     if current_chunk is None:
                         # Ignore text before the first heading encountered in the PDF.
                         continue
-                    current_chunk.append_line(line)
+                    current_chunk.append_line(line, int(page.page_number))
 
         if current_chunk is not None and current_chunk.text_lines:
             chunks.append(current_chunk)
@@ -293,6 +338,7 @@ def match_chunks(
             "source_pdf": chunk.source_pdf,
             "page": chunk.page_number,
             "bbox": chunk.bbox,
+            "page_spans": chunk.page_spans,
             "similarity": best_score,
         }
         matches[best_record.index].append(explanation_payload)
@@ -327,13 +373,14 @@ def render_chunk_previews(chunks: Sequence[Chunk], output_dir: Path, resolution:
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    chunks_by_pdf: Dict[Path, Dict[int, List[Chunk]]] = defaultdict(lambda: defaultdict(list))
+    chunks_by_pdf: Dict[Path, Dict[int, List[Tuple[Chunk, Sequence[float]]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
 
     for chunk in chunks:
-        if not chunk.bbox:
-            continue
         pdf_path = Path(chunk.source_pdf)
-        chunks_by_pdf[pdf_path][chunk.page_number].append(chunk)
+        for page_number, bbox in chunk.iter_page_bboxes():
+            chunks_by_pdf[pdf_path][page_number].append((chunk, bbox))
 
     for pdf_path, pages in chunks_by_pdf.items():
         if not pdf_path.exists():
@@ -355,10 +402,8 @@ def render_chunk_previews(chunks: Sequence[Chunk], output_dir: Path, resolution:
                 page = pdf.pages[page_index]
                 page_image = page.to_image(resolution=resolution)
 
-                for chunk in page_chunks:
-                    if not chunk.bbox:
-                        continue
-                    x0, top, x1, bottom = chunk.bbox
+                for chunk, bbox in page_chunks:
+                    x0, top, x1, bottom = bbox
                     page_image.draw_rect(
                         (x0, top, x1, bottom), stroke="red", stroke_width=2
                     )

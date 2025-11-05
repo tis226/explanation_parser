@@ -140,17 +140,27 @@ class Chunk:
 QUESTION_HEADING_PATTERNS = [
     re.compile(r"^(?P<num>\d{1,3})[\.:]\s*"),
     re.compile(r"^\((?P<num>\d{1,3})\)"),
-    re.compile(r"^(?P<num>\d{1,3})\s+번"),
+    re.compile(r"^(?P<num>\d{1,3})\s*번"),
+    re.compile(r"^제\s*(?P<num>\d{1,3})\s*문"),
 ]
 
 
 def parse_question_heading(text: str) -> Optional[int]:
-    stripped = text.strip()
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+
+    normalized = unicodedata.normalize("NFKC", stripped)
+    normalized = normalized.lstrip("•◦·ㆍ-—=□[](){}<>")
+
     for pattern in QUESTION_HEADING_PATTERNS:
-        match = pattern.match(stripped)
+        match = pattern.match(normalized)
         if match:
             try:
-                return int(match.group("num"))
+                value = match.group("num")
+                if value is None:
+                    return None
+                return int(value)
             except (TypeError, ValueError):
                 return None
     return None

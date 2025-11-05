@@ -182,7 +182,7 @@ def extract_pdf_chunks(pdf_path: Path) -> List[Chunk]:
                         chunks.append(current_chunk)
                     current_chunk = Chunk(
                         question_number=heading_number,
-                        page_number=int(page.page_number) + 1,
+                        page_number=int(page.page_number),
                         source_pdf=str(pdf_path),
                     )
                     current_chunk.append_line(line)

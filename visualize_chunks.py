@@ -81,7 +81,7 @@ def iter_pdf_chunks(pdf_path: Path) -> Iterable[List[LineInfo]]:
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            page_number = int(page.page_number) + 1
+            page_number = int(page.page_number)
             raw_lines = page.extract_text_lines() or []
             ordered_lines = order_page_lines(raw_lines, page.width)
 
